@@ -1,302 +1,116 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 
-# =========================
-# Helpers
-# =========================
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "ERROR: required command not found: $1"
-    exit 1
-  }
-}
-
-log() {
-  echo -e "\n==> $*"
-}
-
-resolve_spec_to_dev() {
-  # fstab의 첫 컬럼(UUID=, PARTUUID=, LABEL=, /dev/...)을 실제 디바이스로 해석
-  local spec="${1:-}"
-  local dev=""
-
-  [[ -z "$spec" ]] && return 0
-  [[ "$spec" == \#* ]] && return 0
-
-  if [[ "$spec" =~ ^UUID=|^PARTUUID=|^LABEL= ]]; then
-    dev="$(findfs "$spec" 2>/dev/null || true)"
-  elif [[ "$spec" =~ ^/dev/ ]]; then
-    dev="$spec"
-  fi
-
-  [[ -n "$dev" ]] && echo "$dev"
-}
-
-detect_root_partition() {
-  # 지정 디스크의 파티션을 스캔하여 "설치된 루트"를 자동 탐지
-  # 조건: mount(ro) 가능 && /etc/fstab && /etc/os-release 존재
-  local disk="$1"
-  local root=""
-
-  mapfile -t parts < <(lsblk -lnpo NAME "$disk" | tail -n +2)
-
-  for p in "${parts[@]}"; do
-    local fstype
-    fstype="$(lsblk -no FSTYPE "$p" 2>/dev/null || true)"
-
-    # 암호화 등은 여기서 제외(필요 시 분기 추가)
-    [[ "$fstype" == "crypto_LUKS" ]] && continue
-    [[ -z "$fstype" ]] && continue
-
-    mkdir -p /mnt
-    if mount -o ro "$p" /mnt >/dev/null 2>&1; then
-      if [[ -f /mnt/etc/fstab && -f /mnt/etc/os-release ]]; then
-        # Arch/파생 여부를 더 강하게 제한하려면 grep 조건을 강화 가능
-        if grep -qiE 'arch|minux' /mnt/etc/os-release; then
-          root="$p"
-          umount /mnt || true
-          break
-        fi
-      fi
-      umount /mnt || true
-    fi
-  done
-
-  [[ -n "$root" ]] && echo "$root"
-}
-
-ensure_mkinitcpio_keyboard_support() {
-  # 설치된 시스템(/mnt)에 대해:
-  # - HOOKS에 keyboard/keymap 포함 (없으면 추가)
-  # - MODULES에 입력장치/USB/HID 및 (요청 맥락상) UFS 계열 모듈을 강제 포함
-  # 목적: root mount 실패 시 emergency shell에서도 키보드 입력 가능
-  local conf="/mnt/etc/mkinitcpio.conf"
-  [[ -f "$conf" ]] || { echo "WARN: $conf not found. Skipping mkinitcpio tuning."; return 0; }
-
-  log "Ensuring mkinitcpio HOOKS include keyboard/keymap..."
-  # HOOKS 라인 가져오기
-  if grep -qE '^\s*HOOKS=\(' "$conf"; then
-    local hooks
-    hooks="$(grep -E '^\s*HOOKS=\(' "$conf" | head -n1)"
-
-    # keyboard 없으면 추가
-    if ! grep -Eq '^\s*HOOKS=\([^)]*\bkeyboard\b' "$conf"; then
-      # udev 다음에 keyboard 넣는 게 일반적으로 무난
-      sed -i 's/^\s*HOOKS=(\([^)]*\budev\b[^)]*\))/HOOKS=(\1 keyboard)/' "$conf" || true
-      # udev 패턴이 안 맞는 경우, 그냥 앞쪽에 삽입
-      if ! grep -Eq '^\s*HOOKS=\([^)]*\bkeyboard\b' "$conf"; then
-        sed -i 's/^\s*HOOKS=(/HOOKS=(keyboard /' "$conf"
-      fi
-    fi
-
-    # keymap 없으면 추가 (keyboard 뒤가 일반적)
-    if ! grep -Eq '^\s*HOOKS=\([^)]*\bkeymap\b' "$conf"; then
-      # keyboard가 있으면 뒤에 keymap 삽입 시도
-      sed -i 's/\bkeyboard\b/keyboard keymap/' "$conf" || true
-      # 그래도 없으면 앞쪽에 삽입
-      if ! grep -Eq '^\s*HOOKS=\([^)]*\bkeymap\b' "$conf"; then
-        sed -i 's/^\s*HOOKS=(/HOOKS=(keymap /' "$conf"
-      fi
-    fi
-  else
-    echo "WARN: HOOKS line not found in mkinitcpio.conf"
-  fi
-
-  log "Ensuring mkinitcpio MODULES include storage + keyboard drivers..."
-  # MODULES 라인 없으면 추가
-  if ! grep -qE '^\s*MODULES=\(' "$conf"; then
-    echo 'MODULES=()' >> "$conf"
-  fi
-
-  # 입력장치/USB/HID (emergency shell 키보드 보장)
-  # - USB 키보드: usbhid, hid_generic + xhci_hcd(USB3), ehci_hcd/uhci_hcd/ohci_hcd(USB2/구형)
-  # - PS/2 내장 키보드: i8042, atkbd
-  # 스토리지(맥락상 eUFS/UFS): ufshcd, ufshcd-pci + scsi_mod, sd_mod
-  local modules=(
-    # keyboard / input
-    usbhid hid_generic hid
-    xhci_hcd xhci_pci
-    ehci_hcd uhci_hcd ohci_hcd
-    i8042 atkbd serio
-
-    # storage (UFS/eUFS 계열)
-    ufshcd ufshcd_pci ufshcd-pci
-    scsi_mod sd_mod
-  )
-
-  for m in "${modules[@]}"; do
-    # ufshcd_pci 같은 언더스코어 이름은 실제 모듈명과 다를 수 있어도
-    # 존재하지 않으면 mkinitcpio에서 경고 후 넘어가므로(치명적 아님) 방어적으로 남겨둠.
-    if ! grep -Eq "^\s*MODULES=\([^)]*\b${m}\b" "$conf"; then
-      sed -i "s/^\s*MODULES=(/MODULES=(${m} /" "$conf"
-    fi
-  done
-
-  # (선택) filesystems/ block hook 확인(대부분 이미 있지만, 없으면 root mount에서 바로 터짐)
-  log "Ensuring mkinitcpio HOOKS include block/filesystems..."
-  if grep -qE '^\s*HOOKS=\(' "$conf"; then
-    if ! grep -Eq '^\s*HOOKS=\([^)]*\bblock\b' "$conf"; then
-      sed -i 's/^\s*HOOKS=(/HOOKS=(block /' "$conf"
-    fi
-    if ! grep -Eq '^\s*HOOKS=\([^)]*\bfilesystems\b' "$conf"; then
-      sed -i 's/^\s*HOOKS=(/HOOKS=(filesystems /' "$conf"
-    fi
-  fi
-
-  log "Rebuilding initramfs (mkinitcpio -P)..."
-  arch-chroot /mnt mkinitcpio -P
-
-  # 실제 포함 여부 간단 검증(있으면 출력)
-  if arch-chroot /mnt command -v lsinitcpio >/dev/null 2>&1; then
-    log "Verifying key modules exist in initramfs (best-effort)..."
-    arch-chroot /mnt bash -c \
-      "lsinitcpio -a /boot/initramfs-linux-lts.img 2>/dev/null | egrep 'usbhid|hid_generic|xhci_hcd|ehci_hcd|i8042|atkbd|ufshcd|sd_mod|scsi_mod' || true"
-  fi
-}
-
-mount_installed_system() {
-  local root_part="$1"
-
-  log "Mounting installed system root: $root_part"
-  mount "$root_part" /mnt
-  mkdir -p /mnt/boot /mnt/boot/efi
-
-  # fstab 기준으로 /boot, /boot/efi 마운트
-  local boot_spec efi_spec boot_dev efi_dev
-  boot_spec="$(awk '$2=="/boot"{print $1; exit}' /mnt/etc/fstab 2>/dev/null || true)"
-  efi_spec="$(awk '$2=="/boot/efi"{print $1; exit}' /mnt/etc/fstab 2>/dev/null || true)"
-
-  boot_dev="$(resolve_spec_to_dev "$boot_spec" || true)"
-  efi_dev="$(resolve_spec_to_dev "$efi_spec" || true)"
-
-  log "Boot spec: ${boot_spec:-(none)} -> ${boot_dev:-(none)}"
-  log "EFI  spec: ${efi_spec:-(none)} -> ${efi_dev:-(none)}"
-
-  [[ -n "$boot_dev" ]] && mount "$boot_dev" /mnt/boot
-  [[ -n "$efi_dev" ]] && mount "$efi_dev" /mnt/boot/efi
-
-  # 필수 마운트: chroot 안정성 (rbind + rslave)
-  mount --rbind /dev  /mnt/dev  && mount --make-rslave /mnt/dev
-  mount --rbind /proc /mnt/proc && mount --make-rslave /mnt/proc
-  mount --rbind /sys  /mnt/sys  && mount --make-rslave /mnt/sys
-  mount --rbind /run  /mnt/run  && mount --make-rslave /mnt/run
-
-  # DNS 안정화
-  cp -L /etc/resolv.conf /mnt/etc/resolv.conf
-}
-
-# =========================
-# Pre-flight checks
-# =========================
-require_cmd ping
-require_cmd jq
-require_cmd lsblk
-require_cmd findfs
-require_cmd awk
-require_cmd archinstall
-require_cmd arch-chroot
-require_cmd mount
-require_cmd umount
-require_cmd tee
-require_cmd genfstab
-
-log "Checking network..."
+echo "Checking network..."
 HOST="8.8.8.8"
 PING_COUNT=2
 
-if ! ping -c "$PING_COUNT" "$HOST" >/dev/null 2>&1; then
-  echo "MINUX installer requires an active network connection."
-  exit 1
-fi
+if ping -c "$PING_COUNT" "$HOST" > /dev/null 2>&1; then
+    echo "Network OK. Starting MINUX installation..."
+    archinstall --config /usr/share/minux.json || {
+        echo "archinstall failed. Exiting..."
+        exit 1
+    }
 
-# =========================
-# Install base (archinstall)
-# =========================
-log "Network OK. Starting MINUX installation (archinstall)..."
-archinstall --config /usr/share/minux.json || {
-  echo "archinstall failed. Exiting..."
-  exit 1
-}
+    echo "Detecting installation device and partitions..."
 
-# =========================
-# Read install disk from archinstall config/log
-# =========================
-log "Detecting installation disk from archinstall log..."
-CONFIG_PATH="/var/log/archinstall/user_configuration.json"
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  echo "ERROR: $CONFIG_PATH not found."
-  exit 1
-fi
+    CONFIG_PATH="/var/log/archinstall/user_configuration.json"
+    if ! [[ -f "$CONFIG_PATH" ]]; then
+        echo "$CONFIG_PATH not found."
+        exit 1
+    fi
 
-INSTALL_DISK="$(jq -r '.disk_config.device_modifications[0].device' "$CONFIG_PATH")"
-if [[ -z "$INSTALL_DISK" || "$INSTALL_DISK" == "null" ]]; then
-  echo "ERROR: Could not read install disk from $CONFIG_PATH"
-  exit 1
-fi
-if [[ ! -b "$INSTALL_DISK" ]]; then
-  echo "ERROR: Install disk is not a block device: $INSTALL_DISK"
-  exit 1
-fi
+    # 디스크 정보 추출
+    INSTALL_DISK=$(jq -r '.disk_config.device_modifications[0].device' "$CONFIG_PATH")
+    PARTITIONS=$(jq -c '.disk_config.device_modifications[0].partitions[]' "$CONFIG_PATH")
 
-log "Install disk: $INSTALL_DISK"
+    # 파티션 접두어 결정 (SATA vs NVMe)
+    if [[ "$INSTALL_DISK" =~ nvme ]]; then
+        PFX="p"
+    else
+        PFX=""
+    fi
 
-# =========================
-# Auto-detect root partition on that disk
-# =========================
-log "Auto-detecting installed root partition on $INSTALL_DISK ..."
-ROOT_PART="$(detect_root_partition "$INSTALL_DISK" || true)"
-if [[ -z "$ROOT_PART" ]]; then
-  echo "ERROR: Could not auto-detect root partition on $INSTALL_DISK"
-  echo "Hint: run 'lsblk -f' and mount root manually."
-  exit 1
-fi
-log "Detected root partition: $ROOT_PART"
+    # 마운트 대상 초기화
+    ROOT_PART=""
+    BOOT_PART=""
+    EFI_PART=""
 
-# =========================
-# Mount installed system correctly
-# =========================
-mount_installed_system "$ROOT_PART"
+    IDX=1
+    while IFS= read -r part; do
+        MOUNTPOINT=$(echo "$part" | jq -r '.mountpoint')
+        case "$MOUNTPOINT" in
+            "/")
+                ROOT_PART="${INSTALL_DISK}${PFX}${IDX}"
+                ;;
+            "/boot")
+                BOOT_PART="${INSTALL_DISK}${PFX}${IDX}"
+                ;;
+            "/boot/efi")
+                EFI_PART="${INSTALL_DISK}${PFX}${IDX}"
+                ;;
+        esac
+        ((IDX++))
+    done <<< "$PARTITIONS"
 
-# =========================
-# Optional: regenerate fstab with UUID (reduces PARTUUID mismatch)
-# =========================
-log "Regenerating /etc/fstab with UUIDs (backup existing first)..."
-if [[ -f /mnt/etc/fstab ]]; then
-  cp -a /mnt/etc/fstab "/mnt/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
-fi
-genfstab -U /mnt > /mnt/etc/fstab
+    if [[ -z "$ROOT_PART" ]]; then
+        echo "Root partition not found in config."
+        exit 1
+    fi
 
-# =========================
-# Run MINUX setup in chroot (logs captured)
-# =========================
-log "Running setup script inside chroot..."
-SCRIPT_DIR="/root/minux_scripts"
+    echo "Root: $ROOT_PART"
+    echo "Boot: ${BOOT_PART:-(none)}"
+    echo "EFI : ${EFI_PART:-(none)}"
 
-arch-chroot /mnt bash -c "
-  set -euxo pipefail
-  pacman -Syu --noconfirm git
-  rm -rf '$SCRIPT_DIR'
-  git clone --recursive https://github.com/kuper0201/minux_scripts '$SCRIPT_DIR'
-  cd '$SCRIPT_DIR'
-  ./setup.sh
-  rm -rf '$SCRIPT_DIR'
-" |& tee /root/minux_install.log
+    # 마운트 작업 시작
+    mount "$ROOT_PART" /mnt
+    mkdir -p /mnt/{boot,boot/efi}
 
-# =========================
-# Ensure emergency shell keyboard support (initramfs)
-# =========================
-ensure_mkinitcpio_keyboard_support
+    if [[ -n "$BOOT_PART" ]]; then
+        mount "$BOOT_PART" /mnt/boot
+    fi
 
-# =========================
-# Finish
-# =========================
-read -rp $'\nDo you want to enter chroot for manual setting? [y/N]: ' answer
-answer="${answer,,}"
+    if [[ -n "$EFI_PART" ]]; then
+        mount "$EFI_PART" /mnt/boot/efi
+    fi
 
-if [[ "$answer" == "y" || "$answer" == "yes" ]]; then
-  arch-chroot /mnt bash
+    # 필수 시스템 디렉토리 마운트
+    mount --bind /dev /mnt/dev
+    mount --bind /proc /mnt/proc
+    mount --bind /sys /mnt/sys
+
+    echo "Running setup script inside chroot..."
+    SCRIPT_DIR="/root/minux_scripts"
+
+    arch-chroot /mnt bash -c "
+        set -euxo pipefail
+        pacman -Syu --noconfirm git
+        git clone https://github.com/kuper0201/minux_scripts $SCRIPT_DIR
+        cd $SCRIPT_DIR
+        ./setup.sh
+        rm -rf $SCRIPT_DIR
+    " |& tee /root/minux_install.log
+
+    # eUFS(UFS) 지원: 설치된 시스템 부팅 시 eUFS 루트 인식용 mkinitcpio 모듈 추가
+    if ! grep -q '\bufs\b' /mnt/etc/mkinitcpio.conf 2>/dev/null; then
+        echo "Adding eUFS (ufs) module to mkinitcpio for installed system..."
+        sed -i 's/^MODULES=(/MODULES=(ufs /' /mnt/etc/mkinitcpio.conf
+        arch-chroot /mnt mkinitcpio -P
+    fi
+
+    read -rp $'\nDo you want to enter chroot for manual setting? [y/N]: ' answer
+    answer=${answer,,}
+
+    if [[ "$answer" == "y" || "$answer" == "yes" ]]; then
+        arch-chroot /mnt bash
+    else
+        echo "Unmounting system..."
+        umount -R /mnt
+        echo "All done!"
+    fi
+
 else
-  log "Unmounting system..."
-  umount -R /mnt
-  log "All done!"
+    echo -e "\nMINUX installer requires an active network connection."
+    echo "Please check your connection and try again."
+    exit 1
 fi
