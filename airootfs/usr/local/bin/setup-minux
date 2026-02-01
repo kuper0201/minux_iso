@@ -90,6 +90,13 @@ if ping -c "$PING_COUNT" "$HOST" > /dev/null 2>&1; then
         rm -rf $SCRIPT_DIR
     "
 
+    # eUFS(UFS) 지원: 설치된 시스템 부팅 시 eUFS 루트 인식용 mkinitcpio 모듈 추가
+    if ! grep -q '\bufs\b' /mnt/etc/mkinitcpio.conf 2>/dev/null; then
+        echo "Adding eUFS (ufs) module to mkinitcpio for installed system..."
+        sed -i 's/^MODULES=(/MODULES=(ufs /' /mnt/etc/mkinitcpio.conf
+        arch-chroot /mnt mkinitcpio -P
+    fi
+
     read -rp $'\nDo you want to enter chroot for manual setting? [y/N]: ' answer
     answer=${answer,,}
 
