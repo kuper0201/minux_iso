@@ -83,12 +83,13 @@ if ping -c "$PING_COUNT" "$HOST" > /dev/null 2>&1; then
     SCRIPT_DIR="/root/minux_scripts"
 
     arch-chroot /mnt bash -c "
-        pacman -Syu --noconfirm git &&
-        git clone https://github.com/kuper0201/minux_scripts $SCRIPT_DIR &&
-        cd $SCRIPT_DIR &&
-        ./setup.sh &&
+        set -euxo pipefail
+        pacman -Syu --noconfirm git
+        git clone https://github.com/kuper0201/minux_scripts $SCRIPT_DIR
+        cd $SCRIPT_DIR
+        ./setup.sh
         rm -rf $SCRIPT_DIR
-    "
+    " |& tee /root/minux_install.log
 
     # eUFS(UFS) 지원: 설치된 시스템 부팅 시 eUFS 루트 인식용 mkinitcpio 모듈 추가
     if ! grep -q '\bufs\b' /mnt/etc/mkinitcpio.conf 2>/dev/null; then
