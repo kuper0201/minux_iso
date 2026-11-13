@@ -1,174 +1,52 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-echo "Checking network..."
-HOST="8.8.8.8"
-PING_COUNT=2
-
-if ! ping -c "$PING_COUNT" "$HOST" >/dev/null 2>&1; then
-  echo -e "\nMINUX installer requires an active network connection."
-  echo "🔌 Please check your connection and try again."
-  exit 1
+if (( EUID != 0 )); then
+    echo "Run setup-minux as root." >&2
+    exit 1
 fi
+config_path=/usr/share/minux.json
+archinstall_args=()
+while (( $# )); do
+    case "$1" in
+        --config)
+            [[ $# -ge 2 ]] || { echo "--config requires a file" >&2; exit 2; }
+            config_path=$2
+            shift 2
+            ;;
+        --config=*) config_path=${1#*=}; shift ;;
+        *) archinstall_args+=("$1"); shift ;;
+    esac
+done
+for tool in archinstall jq; do
+    command -v "$tool" >/dev/null || { echo "Missing required command: $tool" >&2; exit 1; }
+done
+[[ -r "$config_path" ]] || { echo "Cannot read configuration: $config_path" >&2; exit 1; }
 
-echo "Network OK. Starting MINUX installation..."
-
-archinstall --config /usr/share/minux.json || {
-  echo "archinstall failed. Exiting..."
-  exit 1
-}
-
-echo "Detecting installation device and partitions..."
-
-CONFIG_PATH="/var/log/archinstall/user_configuration.json"
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  echo "$CONFIG_PATH not found."
-  exit 1
+# Run customization while archinstall still owns the mounted filesystem layout.
+# This supports Btrfs, encryption and separate mounts without guessing devices,
+# and finishes before archinstall offers to reboot.
+custom_command=$(cat <<'MINUX_POST_INSTALL'
+set -Eeuo pipefail
+exec > >(tee -a /var/log/minux-install.log) 2>&1
+rm -f /var/lib/minux/install-complete
+pacman -Syu --needed --noconfirm git
+scripts_dir=$(mktemp -d /root/minux-install.XXXXXX)
+trap 'rm -rf "$scripts_dir"' EXIT
+git -C "$scripts_dir" init -q
+git -C "$scripts_dir" fetch --depth 1 https://github.com/kuper0201/minux_scripts f36b85193dd940562876f18f4d9947a62a79bf81
+git -C "$scripts_dir" checkout -q --detach FETCH_HEAD
+"$scripts_dir/setup.sh"
+install -d /var/lib/minux
+printf '%s\n' 'f36b85193dd940562876f18f4d9947a62a79bf81' > /var/lib/minux/install-complete
+MINUX_POST_INSTALL
+)
+# arch-chroot bind-mounts the live resolver; give it uplink DNS, not a
+# loopback stub which may be unavailable in its systemd execution context.
+if [[ -s /run/systemd/resolve/resolv.conf ]]; then
+    ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf
 fi
-
-INSTALL_DISK="$(jq -r '.disk_config.device_modifications[0].device // empty' "$CONFIG_PATH")"
-if [[ -z "$INSTALL_DISK" || ! -b "$INSTALL_DISK" ]]; then
-  echo "Install disk not found or not a block device in config: '$INSTALL_DISK'"
-  exit 1
-fi
-
-# 디스크명이 숫자로 끝나면(p 필요): nvme0n1, mmcblk0, loop0 ...
-# 숫자로 끝나지 않으면(p 불필요): sda, vda ...
-part_path() {
-  local disk="$1"
-  local idx="$2"
-  if [[ "$disk" =~ [0-9]$ ]]; then
-    echo "${disk}p${idx}"
-  else
-    echo "${disk}${idx}"
-  fi
-}
-
-# config에서 특정 mountpoint(/, /boot, /boot/efi)에 해당하는 파티션 객체 1개 가져오기
-part_obj_by_mountpoint() {
-  local mp="$1"
-  jq -c --arg mp "$mp" '
-    .disk_config.device_modifications[0].partitions[]
-    | select(.mountpoint == $mp)
-  ' "$CONFIG_PATH" | head -n 1
-}
-
-# mountpoint로 파티션 디바이스 경로를 "정확하게" 해석:
-# 1) config에 /dev/... device/path가 있으면 사용
-# 2) PARTUUID가 있으면 /dev/disk/by-partuuid 로 resolve
-# 3) UUID가 있으면 /dev/disk/by-uuid 로 resolve
-# 4) 최후 수단: partitions 배열에서의 index+1을 파티션 번호로 가정
-resolve_partition_device() {
-  local mp="$1"
-  local obj
-  obj="$(part_obj_by_mountpoint "$mp" || true)"
-  [[ -z "$obj" ]] && return 1
-
-  local partuuid uuid devpath
-
-  # archinstall 버전/환경에 따라 키가 달라질 수 있어 후보를 다수 지원
-  devpath="$(echo "$obj" | jq -r '.device // .path // .dev_path // empty')"
-  partuuid="$(echo "$obj" | jq -r '.partuuid // .PARTUUID // .part_uuid // empty')"
-  uuid="$(echo "$obj" | jq -r '.uuid // .UUID // .fs_uuid // empty')"
-
-  if [[ -n "$devpath" && -b "$devpath" ]]; then
-    echo "$devpath"
-    return 0
-  fi
-
-  if [[ -n "$partuuid" && -e "/dev/disk/by-partuuid/$partuuid" ]]; then
-    readlink -f "/dev/disk/by-partuuid/$partuuid"
-    return 0
-  fi
-
-  if [[ -n "$uuid" && -e "/dev/disk/by-uuid/$uuid" ]]; then
-    readlink -f "/dev/disk/by-uuid/$uuid"
-    return 0
-  fi
-
-  local idx
-  idx="$(jq -r --arg mp "$mp" '
-    [ .disk_config.device_modifications[0].partitions[].mountpoint ] | index($mp) + 1
-  ' "$CONFIG_PATH" 2>/dev/null || true)"
-
-  if [[ -n "$idx" && "$idx" =~ ^[0-9]+$ ]]; then
-    local dev
-    dev="$(part_path "$INSTALL_DISK" "$idx")"
-    if [[ -b "$dev" ]]; then
-      echo "$dev"
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
-ROOT_PART="$(resolve_partition_device "/")" || {
-  echo "Root partition not resolvable from config."
-  exit 1
-}
-
-BOOT_PART="$(resolve_partition_device "/boot" || true)"
-EFI_PART="$(resolve_partition_device "/boot/efi" || true)"
-
-echo "Install disk: $INSTALL_DISK"
-echo "Root: $ROOT_PART"
-echo "Boot: ${BOOT_PART:-(none)}"
-echo "EFI : ${EFI_PART:-(none)}"
-
-echo "Mounting installed system..."
-mount "$ROOT_PART" /mnt
-mkdir -p /mnt/boot /mnt/boot/efi
-
-if [[ -n "${BOOT_PART:-}" ]]; then
-  mount "$BOOT_PART" /mnt/boot
-fi
-
-if [[ -n "${EFI_PART:-}" ]]; then
-  mount "$EFI_PART" /mnt/boot/efi
-fi
-
-# 필수 시스템 디렉토리 마운트 (rbind + rslave 권장)
-mount --rbind /dev /mnt/dev
-mount --make-rslave /mnt/dev
-mount --rbind /proc /mnt/proc
-mount --make-rslave /mnt/proc
-mount --rbind /sys /mnt/sys
-mount --make-rslave /mnt/sys
-
-echo "Running setup script inside chroot..."
-SCRIPT_DIR="/root/minux_scripts"
-
-arch-chroot /mnt bash -c "
-  set -euxo pipefail
-  pacman -Syu --noconfirm git
-  git clone https://github.com/kuper0201/minux_scripts $SCRIPT_DIR
-  cd $SCRIPT_DIR
-  ./setup.sh
-  rm -rf $SCRIPT_DIR
-" |& tee /root/minux_install.log
-
-# eUFS(UFS) 지원: 설치된 시스템 부팅 시 루트 인식용 mkinitcpio 모듈 추가
-# 필요 시 ufshcd 등 추가 모듈을 함께 넣을 수 있음 (환경에 따라 다름)
-if [[ -f /mnt/etc/mkinitcpio.conf ]]; then
-  if ! grep -qE '^\s*MODULES=\(.*\bufs\b' /mnt/etc/mkinitcpio.conf; then
-    echo "Adding eUFS (ufs) module to mkinitcpio for installed system..."
-    if grep -qE '^\s*MODULES=\(' /mnt/etc/mkinitcpio.conf; then
-      sed -i -E 's/^\s*MODULES=\(([^)]*)\)/MODULES=(ufs \1)/' /mnt/etc/mkinitcpio.conf
-    else
-      echo 'MODULES=(ufs)' >> /mnt/etc/mkinitcpio.conf
-    fi
-    arch-chroot /mnt mkinitcpio -P
-  fi
-fi
-
-read -rp $'\nDo you want to enter chroot for manual setting? [y/N]: ' answer
-answer=${answer,,}
-
-if [[ "$answer" == "y" || "$answer" == "yes" ]]; then
-  arch-chroot /mnt bash
-else
-  echo "Unmounting system..."
-  umount -R /mnt
-  echo "All done!"
-fi
+config=$(mktemp /tmp/minux-config.XXXXXX.json)
+trap 'rm -f "$config"' EXIT
+jq --arg command "$custom_command" '.custom_commands = ((.custom_commands // []) + [$command])' "$config_path" > "$config"
+archinstall --config "$config" "${archinstall_args[@]}"
